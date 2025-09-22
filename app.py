@@ -414,13 +414,15 @@ def status():
             'initialized': False
         }), 500
 
+# MODIFICATION: Add version number for deployment verification
 @app.route('/health', methods=['GET'])
 def health():
     """Simple health check endpoint for monitoring services"""
     return jsonify({
         'status': 'healthy',
         'timestamp': time.time(),
-        'optimization': 'memory_managed'
+        'optimization': 'memory_managed',
+        'version': '1.1' # Add this line to verify deployment
     })
 
 # MODIFICATION: Allow both GET and POST requests for the webhook endpoint
