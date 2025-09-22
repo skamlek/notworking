@@ -11,6 +11,9 @@ import hmac
 import json
 import logging
 import base64
+import time
+import threading
+import requests
 from flask import Flask, request, jsonify
 from tronpy import Tron
 from tronpy.providers import HTTPProvider
@@ -25,9 +28,6 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
-
-# Initialize the bot when the app is loaded (for Gunicorn)
-initialize_bot()
 
 # Global variables for bot configuration
 client = None
@@ -394,187 +394,199 @@ def process_webhook_payload(payload):
                     logger.info(f"Transaction detected to target address: {target_addr}, txid: {txid}")
                     return {'detected': True, 'txid': txid}
         
-        # Check for address-specific notifications
-        if 'address' in data and target_addr and data['address'].lower() == target_addr.lower():
-            txid = data.get('txid') or data.get('hash')
-            logger.info(f"Address notification for target address: {target_addr}, txid: {txid}")
-            return {'detected': True, 'txid': txid}
-        
-        logger.info("Webhook received but no relevant Tron transaction detected")
+        # Log unmatched payload for debugging
+        logger.debug(f"No matching transaction found in payload: {json.dumps(data, indent=2)}")
         return {'detected': False, 'txid': None}
         
     except Exception as e:
         logger.error(f"Error processing webhook payload: {e}")
         return {'detected': False, 'txid': None}
 
-def trigger_sweep_check(txid=None):
-    """Check balance and trigger sweep if needed"""
-    global min_trx_left, permission_id
-    try:
-        # Reordered null checks before any operations
-        if not client:
-            logger.error("Tron client not initialized, cannot perform sweep check")
-            return False
+def keep_alive():
+    """
+    A function to be run in a background thread to keep the Render instance alive.
+    Prevents the free tier from spinning down after 15 minutes of inactivity.
+    """
+    while True:
+        try:
+            # Get the app's own URL from environment variables, which Render sets.
+            # Default to localhost for local testing.
+            render_url = os.getenv('RENDER_EXTERNAL_URL', f"http://127.0.0.1:{os.getenv('PORT', 5000)}")
             
-        if not target_addr:
-            logger.error("Target address not set, cannot perform sweep check")
-            return False
-            
-        if not private_key:
-            logger.error("Private key not available, cannot perform sweep")
-            return False
-            
-        if not safe_wallet:
-            logger.error("Safe wallet not set, cannot perform sweep")
-            return False
-        
-        # Check for duplicate transaction processing
-        if txid and txid in processed_txids:
-            logger.info(f"Transaction {txid} already processed, skipping duplicate sweep check")
-            return False
-        
-        # Get balance first
-        balance_trx = get_balance(client, target_addr)
-        logger.info(f"Current balance: {balance_trx:.6f} TRX")
-        
-        # Get balance in SUN for precise comparison
-        account_info = client.get_account(target_addr)
-        balance_sun = account_info.get('balance', 0)
-        fee_reserve_sun = int(min_trx_left * 1_000_000)  # Convert TRX to SUN
-        sweep_threshold_sun = 1_000_000 + fee_reserve_sun  # 1 TRX + fee reserve
-        
-        # Add txid to processed cache if provided
-        if txid:
-            processed_txids.add(txid)
-            # Keep cache size manageable (last 1000 transactions)
-            if len(processed_txids) > 1000:
-                processed_txids.clear()
-                logger.info("Cleared processed txids cache")
-        
-        # Sweep if balance > threshold (1 TRX + fee reserve)
-        if balance_sun > sweep_threshold_sun:
-            logger.info(f"Balance {balance_trx:.6f} TRX > {sweep_threshold_sun / 1_000_000:.1f} TRX threshold, initiating sweep...")
-            success = sweep_trx(client, private_key, target_addr, safe_wallet, min_trx_left, permission_id)
-            
-            if success:
-                logger.info("Sweep completed successfully")
-                return True
+            if render_url:
+                # Send a request to the /health endpoint to keep it active
+                health_url = f"{render_url}/health"
+                logger.info(f"Keep-alive: Pinging {health_url}")
+                response = requests.get(health_url, timeout=10)  # Set a timeout
+                logger.info(f"Keep-alive: Response status {response.status_code}")
             else:
-                logger.error("Sweep failed")
-                return False
-        else:
-            logger.info(f"Balance {balance_trx:.6f} TRX <= {sweep_threshold_sun / 1_000_000:.1f} TRX threshold, no action needed")
-            return False
+                logger.warning("Keep-alive: RENDER_EXTERNAL_URL not found. Self-pinging disabled.")
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Keep-alive: Failed to ping self. Error: {e}")
+        except Exception as e:
+            logger.error(f"Keep-alive: An unexpected error occurred: {e}")
             
-    except Exception as e:
-        logger.error(f"Error during sweep check: {e}")
-        return False
+        # Wait for 10 minutes (600 seconds) before the next ping
+        # This is well within the 15-minute inactivity timeout
+        time.sleep(600)
 
 # Flask Routes
 @app.route('/', methods=['GET'])
 def status():
     """Status endpoint showing bot configuration and health"""
     try:
-        balance_trx = get_balance(client, target_addr) if client and target_addr else 0
+        # Check if bot is properly initialized
+        if not client or not target_addr or not safe_wallet:
+            return jsonify({
+                'status': 'error',
+                'message': 'Bot not properly initialized',
+                'initialized': False
+            }), 500
         
-        status_info = {
-            'status': 'running',
-            'bot_type': 'TRX Sweep Bot - Webhook Mode',
+        # Get current balance
+        current_balance = get_balance(client, target_addr)
+        
+        return jsonify({
+            'status': 'active',
+            'message': 'TRX Sweep Bot is running',
+            'initialized': True,
             'target_address': target_addr,
             'safe_wallet': safe_wallet,
-            'current_balance_trx': round(balance_trx, 6),
-            'webhook_configured': bool(webhook_security_token),
-            'initialized': bool(client and private_key)
-        }
-        
-        return jsonify(status_info), 200
-        
+            'current_balance_trx': current_balance,
+            'min_trx_left': min_trx_left,
+            'permission_id': permission_id,
+            'processed_txids_count': len(processed_txids)
+        })
     except Exception as e:
         logger.error(f"Error in status endpoint: {e}")
-        return jsonify({'error': 'Status check failed', 'details': str(e)}), 500
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'initialized': False
+        }), 500
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Simple health check endpoint"""
-    return jsonify({'status': 'healthy', 'timestamp': int(__import__('time').time())}), 200
+    """Simple health check endpoint for monitoring services"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': time.time()
+    })
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Webhook endpoint for QuickNode and other webhook notifications"""
+    """Webhook endpoint for receiving transaction notifications"""
     try:
-        # Get the raw payload and check for various signature headers
+        # Get request data
         payload = request.get_data()
+        signature = request.headers.get('X-Signature') or request.headers.get('X-Hub-Signature-256')
         
-        # Check for QuickNode and other common webhook signature headers
-        signature = (
-            request.headers.get('X-Quicknode-Signature') or 
-            request.headers.get('X-QuickNode-Signature') or
-            request.headers.get('X-Webhook-Signature') or 
-            request.headers.get('X-Hub-Signature-256') or
-            request.headers.get('X-Hub-Signature')
-        )
+        logger.info(f"Received webhook request from {request.remote_addr}")
         
-        logger.info(f"Webhook received from {request.remote_addr}, checking signature...")
-        
-        # Verify webhook signature
-        if not verify_webhook_signature(payload, signature, webhook_security_token):
-            logger.warning(f"Webhook signature verification failed. Headers: {dict(request.headers)}")
-            return jsonify({'error': 'Invalid signature'}), 401
-        
-        logger.info("Webhook received with valid signature")
+        # Verify webhook signature if configured
+        if webhook_security_token:
+            if not verify_webhook_signature(payload, signature, webhook_security_token):
+                logger.warning("Webhook signature verification failed")
+                return jsonify({'error': 'Invalid signature'}), 401
+        else:
+            logger.warning("Webhook security token not configured - accepting all requests")
         
         # Process the webhook payload
         result = process_webhook_payload(payload)
-        transaction_detected = result.get('detected', False)
-        txid = result.get('txid')
         
-        if transaction_detected:
-            # Trigger sweep check with transaction ID for deduplication
-            sweep_result = trigger_sweep_check(txid=txid)
-            return jsonify({
-                'status': 'processed',
-                'transaction_detected': True,
-                'txid': txid,
-                'sweep_triggered': sweep_result
-            }), 200
+        if result['detected']:
+            txid = result['txid']
+            
+            # Check if we've already processed this transaction
+            if txid and txid in processed_txids:
+                logger.info(f"Transaction {txid} already processed, skipping")
+                return jsonify({
+                    'status': 'skipped',
+                    'message': 'Transaction already processed',
+                    'txid': txid
+                })
+            
+            # Add to processed set
+            if txid:
+                processed_txids.add(txid)
+            
+            # Perform the sweep
+            logger.info(f"Attempting to sweep TRX from {target_addr}")
+            sweep_success = sweep_trx(client, private_key, target_addr, safe_wallet, min_trx_left, permission_id)
+            
+            if sweep_success:
+                return jsonify({
+                    'status': 'success',
+                    'message': 'TRX sweep completed successfully',
+                    'txid': txid
+                })
+            else:
+                return jsonify({
+                    'status': 'no_action',
+                    'message': 'No sweep needed or sweep failed',
+                    'txid': txid
+                })
         else:
+            logger.info("No relevant transaction detected in webhook payload")
             return jsonify({
-                'status': 'processed',
-                'transaction_detected': False,
-                'txid': txid,
-                'sweep_triggered': False
-            }), 200
-        
+                'status': 'ignored',
+                'message': 'No relevant transaction detected'
+            })
+            
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
-        return jsonify({'error': 'Webhook processing failed', 'details': str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/manual-sweep', methods=['POST'])
 def manual_sweep():
-    """Manual sweep trigger endpoint for backward compatibility"""
+    """Manual sweep endpoint for testing purposes"""
     try:
-        # Verify authorization (optional security header)
-        auth_header = request.headers.get('Authorization')
-        if auth_header != f"Bearer {webhook_security_token}":
-            logger.warning("Manual sweep attempted without proper authorization")
-            return jsonify({'error': 'Unauthorized'}), 401
+        logger.info("Manual sweep requested")
         
-        logger.info("Manual sweep triggered")
-        sweep_result = trigger_sweep_check()
+        # Check if bot is properly initialized
+        if not client or not target_addr or not safe_wallet:
+            return jsonify({
+                'status': 'error',
+                'message': 'Bot not properly initialized'
+            }), 500
         
-        return jsonify({
-            'status': 'completed',
-            'sweep_triggered': sweep_result
-        }), 200
+        # Perform the sweep
+        sweep_success = sweep_trx(client, private_key, target_addr, safe_wallet, min_trx_left, permission_id)
         
+        if sweep_success:
+            return jsonify({
+                'status': 'success',
+                'message': 'Manual TRX sweep completed successfully'
+            })
+        else:
+            return jsonify({
+                'status': 'no_action',
+                'message': 'No sweep needed or sweep failed'
+            })
+            
     except Exception as e:
         logger.error(f"Error in manual sweep: {e}")
-        return jsonify({'error': 'Manual sweep failed', 'details': str(e)}), 500
+        return jsonify({'error': str(e)}), 500
+
+# Initialize bot and start keep-alive thread when the app starts
+try:
+    initialize_bot()
+    
+    # Start the keep-alive thread for Render free tier
+    keep_alive_thread = threading.Thread(name='keep-alive', target=keep_alive)
+    keep_alive_thread.daemon = True  # Allows the main app to exit even if this thread is running
+    keep_alive_thread.start()
+    logger.info("Keep-alive background thread started.")
+    
+except Exception as e:
+    logger.error(f"Failed to initialize bot: {e}")
+    # Continue running Flask app even if bot initialization fails
+    # This allows for debugging via the status endpoint
 
 if __name__ == "__main__":
-
-    
-    # Run Flask app on port 5000 for Replit environment
+    # Run Flask app on port 5000 for local testing
     port = int(os.getenv('PORT', 5000))
     logger.info(f"Starting Flask TRX Sweep Bot on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+
