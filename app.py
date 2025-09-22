@@ -20,6 +20,7 @@ from tronpy.providers import HTTPProvider
 from tronpy.keys import PrivateKey
 
 # Configure simple logging with reduced verbosity for production
+# This is configured to ensure it prints to Render's stdout
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -28,6 +29,40 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
+
+# --- START OF "BLACK BOX RECORDER" ---
+# This code was recommended to log the exact details of every incoming request
+# before any of our route logic runs. This will help us see what QuickNode is sending.
+@app.before_request
+def log_request_info():
+    """Log incoming request details for debugging."""
+    try:
+        # Log method, full path, and remote address
+        app.logger.info(f"--- Incoming Request ---")
+        app.logger.info(f"Method: {request.method}")
+        app.logger.info(f"Path: {request.full_path}")
+        app.logger.info(f"Remote Address: {request.remote_addr}")
+        
+        # Log all headers as a dictionary
+        headers = {k: v for k, v in request.headers.items()}
+        app.logger.info(f"Headers: {headers}")
+        
+        # Log raw body (if any)
+        data = request.get_data()
+        if data:
+            try:
+                # Try to decode as UTF-8, which is common for JSON payloads
+                app.logger.info(f"Body (decoded): {data.decode('utf-8')}")
+            except UnicodeDecodeError:
+                # If it's not UTF-8, log it as raw bytes
+                app.logger.info(f"Body (binary/non-UTF-8): {data}")
+        else:
+            app.logger.info("Body: (empty)")
+        app.logger.info(f"--- End of Request ---")
+    except Exception as e:
+        app.logger.error(f"Error in before_request logger: {e}")
+# --- END OF "BLACK BOX RECORDER" ---
+
 
 # Global variables for bot configuration
 client = None
@@ -422,25 +457,24 @@ def health():
         'status': 'healthy',
         'timestamp': time.time(),
         'optimization': 'memory_managed',
-        'version': '1.1' # Add this line to verify deployment
+        'version': '1.3' # Incremented version to verify deployment of the logger
     })
 
-# MODIFICATION: Allow both GET and POST requests for the webhook endpoint
-@app.route('/webhook', methods=['POST', 'GET'])
+# We are keeping the /webhook-v2 endpoint from the previous attempt
+@app.route('/webhook-v2', methods=['POST', 'GET'])
 def webhook():
     """Webhook endpoint for receiving transaction notifications - optimized for free tier"""
-    # MODIFICATION: Handle QuickNode's GET request for connection checks
+    # Handle QuickNode's GET request for connection checks
     if request.method == 'GET':
-        logger.info("Received GET request for webhook health check. Responding 200 OK.")
+        # The before_request logger will have already run and captured the details.
+        # We just need to return a success response.
         return jsonify({"status": "ok", "message": "Webhook endpoint is active. Use POST for data."}), 200
     
     # --- Existing POST request logic continues below ---
     try:
-        # Get request data
+        # The before_request logger has already logged the payload, so we can proceed.
         payload = request.get_data()
         signature = request.headers.get('X-Signature') or request.headers.get('X-Hub-Signature-256')
-        
-        logger.info(f"Received webhook request from {request.remote_addr}")
         
         # Verify webhook signature if configured
         if webhook_security_token:
@@ -488,7 +522,7 @@ def webhook():
                     'error': sweep_result.get('error')
                 })
         else:
-            logger.info("No relevant transaction detected in webhook payload")
+            # This part will run if the payload is for a POST request but doesn't match our filter
             return jsonify({
                 'status': 'ignored',
                 'message': 'No relevant transaction detected'
