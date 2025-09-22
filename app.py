@@ -56,38 +56,38 @@ def validate_env_vars():
         exit(1)
     
     # Validate TRON addresses
-    target_addr = os.getenv('TARGET_ADDR', '').strip()
-    safe_wallet = os.getenv('SAFE_WALLET', '').strip()
+    target_addr_val = os.getenv('TARGET_ADDR', '').strip()
+    safe_wallet_val = os.getenv('SAFE_WALLET', '').strip()
     
-    if not (target_addr and target_addr.startswith('T') and len(target_addr) == 34):
-        logger.error(f"Invalid TARGET_ADDR format: {target_addr}")
+    if not (target_addr_val and target_addr_val.startswith('T') and len(target_addr_val) == 34):
+        logger.error(f"Invalid TARGET_ADDR format: {target_addr_val}")
         exit(1)
     
-    if not (safe_wallet and safe_wallet.startswith('T') and len(safe_wallet) == 34):
-        logger.error(f"Invalid SAFE_WALLET format: {safe_wallet}")
+    if not (safe_wallet_val and safe_wallet_val.startswith('T') and len(safe_wallet_val) == 34):
+        logger.error(f"Invalid SAFE_WALLET format: {safe_wallet_val}")
         exit(1)
     
     # Validate private key
-    private_key = os.getenv('PRIVATE_KEY', '').strip()
-    if private_key.startswith('0x'):
-        private_key = private_key[2:]
+    private_key_val = os.getenv('PRIVATE_KEY', '').strip()
+    if private_key_val.startswith('0x'):
+        private_key_val = private_key_val[2:]
     
-    if not private_key or len(private_key) != 64:
+    if not private_key_val or len(private_key_val) != 64:
         logger.error(f"Invalid PRIVATE_KEY format: must be 64 hex characters")
         exit(1)
     
     try:
-        PrivateKey(bytes.fromhex(private_key))
+        PrivateKey(bytes.fromhex(private_key_val))
         
         # Validate optional numeric environment variables
-        min_trx_left = float(os.getenv('MIN_TRX_LEFT', '0.3'))
-        if min_trx_left < 0 or min_trx_left > 10:
-            logger.error(f"Invalid MIN_TRX_LEFT: {min_trx_left}. Must be between 0 and 10 TRX")
+        min_trx_left_val = float(os.getenv('MIN_TRX_LEFT', '0.3'))
+        if min_trx_left_val < 0 or min_trx_left_val > 10:
+            logger.error(f"Invalid MIN_TRX_LEFT: {min_trx_left_val}. Must be between 0 and 10 TRX")
             exit(1)
         
-        permission_id = int(os.getenv('PERMISSION_ID', '4'))
-        if permission_id < 0 or permission_id > 10:
-            logger.error(f"Invalid PERMISSION_ID: {permission_id}. Must be between 0 and 10")
+        permission_id_val = int(os.getenv('PERMISSION_ID', '4'))
+        if permission_id_val < 0 or permission_id_val > 10:
+            logger.error(f"Invalid PERMISSION_ID: {permission_id_val}. Must be between 0 and 10")
             exit(1)
         
         logger.info("Environment variables validated successfully")
@@ -98,11 +98,11 @@ def validate_env_vars():
         logger.error(f"Invalid PRIVATE_KEY: {e}")
         exit(1)
 
-def get_balance(client, address):
+def get_balance(client_instance, address):
     """Get TRX balance for address in TRX units with timeout"""
     try:
         # Use get_account() with a reasonable timeout
-        account_info = client.get_account(address)
+        account_info = client_instance.get_account(address)
         balance_sun = account_info.get('balance', 0)
         balance_trx = balance_sun / 1_000_000  # Convert from SUN to TRX
         return balance_trx
@@ -110,22 +110,22 @@ def get_balance(client, address):
         logger.error(f"Error getting balance for {address}: {e}")
         return 0
 
-def sweep_trx_async(client, private_key, target_addr, safe_wallet, min_trx_left, permission_id):
+def sweep_trx_async(client_instance, p_key, t_addr, s_wallet, m_trx_left, p_id):
     """
     Optimized sweep function that broadcasts transaction without waiting for confirmation
     This prevents worker timeouts by not blocking on blockchain confirmation
     """
     try:
         # Get the bot's address
-        bot_address = private_key.public_key.to_base58check_address()
+        bot_address = p_key.public_key.to_base58check_address()
         
         # Get current balance with timeout protection
-        account_info = client.get_account(target_addr)
+        account_info = client_instance.get_account(t_addr)
         balance_sun = account_info.get('balance', 0)
         balance_trx = balance_sun / 1_000_000
         
         # Use configurable fee reserve
-        fee_reserve_sun = int(min_trx_left * 1_000_000)  # Convert TRX to SUN
+        fee_reserve_sun = int(m_trx_left * 1_000_000)  # Convert TRX to SUN
         
         # Check if we should sweep using the new logic
         if balance_sun <= (1_000_000 + fee_reserve_sun):  # 1 TRX + fee reserve
@@ -140,16 +140,16 @@ def sweep_trx_async(client, private_key, target_addr, safe_wallet, min_trx_left,
             logger.warning(f"Insufficient balance after fee reserve: {balance_trx:.6f} TRX")
             return {'success': False, 'reason': 'insufficient_after_fees', 'txid': None}
         
-        logger.info(f"Sweeping {send_amount_trx:.6f} TRX from {target_addr} to {safe_wallet}")
+        logger.info(f"Sweeping {send_amount_trx:.6f} TRX from {t_addr} to {s_wallet}")
         
         # Check if this is direct control or multi-sig
-        if bot_address == target_addr:
+        if bot_address == t_addr:
             # Direct control - use standard transfer
             logger.info("Using direct control transfer")
             txn = (
-                client.trx.transfer(target_addr, safe_wallet, send_amount_sun)
+                client_instance.trx.transfer(t_addr, s_wallet, send_amount_sun)
                 .build()
-                .sign(private_key)
+                .sign(p_key)
             )
         else:
             # Multi-signature setup - use permission-based transfer
@@ -157,18 +157,18 @@ def sweep_trx_async(client, private_key, target_addr, safe_wallet, min_trx_left,
             try:
                 # Create transaction with permission ID for active_trx
                 txn = (
-                    client.trx.transfer(target_addr, safe_wallet, send_amount_sun)
-                    .permission_id(permission_id)  # Configurable permission ID
+                    client_instance.trx.transfer(t_addr, s_wallet, send_amount_sun)
+                    .permission_id(p_id)  # Configurable permission ID
                     .build()
-                    .sign(private_key)
+                    .sign(p_key)
                 )
             except Exception as perm_e:
                 logger.warning(f"Permission-based transfer failed: {perm_e}")
                 logger.info("Attempting standard transfer as fallback")
                 txn = (
-                    client.trx.transfer(target_addr, safe_wallet, send_amount_sun)
+                    client_instance.trx.transfer(t_addr, s_wallet, send_amount_sun)
                     .build()
-                    .sign(private_key)
+                    .sign(p_key)
                 )
         
         # CRITICAL OPTIMIZATION: Broadcast without waiting for confirmation
@@ -180,7 +180,7 @@ def sweep_trx_async(client, private_key, target_addr, safe_wallet, min_trx_left,
         if result and hasattr(result, 'txid'):
             txid = result.txid
             logger.info(f"Transaction broadcasted successfully! TXID: {txid}")
-            logger.info(f"Broadcasted sweep of {send_amount_trx:.6f} TRX to {safe_wallet}")
+            logger.info(f"Broadcasted sweep of {send_amount_trx:.6f} TRX to {s_wallet}")
             logger.info("Note: Transaction confirmation will happen asynchronously on the blockchain")
             
             return {'success': True, 'reason': 'broadcasted', 'txid': txid}
@@ -295,18 +295,18 @@ def process_webhook_payload(payload):
                 if contract_type == 'TransferContract':
                     parameter = contract.get('parameter', {})
                     value = parameter.get('value', {})
-                    to_address = value.get('to_address')
+                    to_address_hex = value.get('to_address')
                     
-                    if to_address and target_addr:
+                    if to_address_hex and target_addr:
                         # Convert hex address to base58 if needed
                         try:
-                            if to_address.startswith('41'):  # Tron hex format
+                            if to_address_hex.startswith('41'):  # Tron hex format
                                 import base58
-                                to_address_b58 = base58.b58encode_check(bytes.fromhex(to_address)).decode('utf-8')
+                                to_address_b58 = base58.b58encode_check(bytes.fromhex(to_address_hex)).decode('utf-8')
                                 if to_address_b58 == target_addr:
                                     logger.info(f"Tron TRX transfer detected to target address: {target_addr}, txid: {txid}")
                                     return {'detected': True, 'txid': txid}
-                            elif to_address == target_addr:
+                            elif to_address_hex == target_addr: # Should not happen, but as a fallback
                                 logger.info(f"Tron TRX transfer detected to target address: {target_addr}, txid: {txid}")
                                 return {'detected': True, 'txid': txid}
                         except Exception as addr_e:
@@ -358,7 +358,7 @@ def keep_alive():
         try:
             # Get the app's own URL from environment variables, which Render sets.
             # Default to localhost for local testing.
-            render_url = os.getenv('RENDER_EXTERNAL_URL', f"http://127.0.0.1:{os.getenv('PORT', 5000)}")
+            render_url = os.getenv('RENDER_EXTERNAL_URL', f"http://127.0.0.1:{os.getenv('PORT', 5000 )}")
             
             if render_url:
                 # Send a request to the /health endpoint to keep it active
@@ -525,22 +525,19 @@ def manual_sweep():
 
 # Initialize bot and start keep-alive thread when the app starts
 try:
-    initialize_bot()
-    
-    # Start the keep-alive thread for Render free tier
-    keep_alive_thread = threading.Thread(name='keep-alive', target=keep_alive)
-    keep_alive_thread.daemon = True  # Allows the main app to exit even if this thread is running
-    keep_alive_thread.start()
-    logger.info("Keep-alive background thread started.")
+    if initialize_bot():
+        # Start the keep-alive thread for Render free tier only if initialization is successful
+        keep_alive_thread = threading.Thread(name='keep-alive', target=keep_alive)
+        keep_alive_thread.daemon = True  # Allows the main app to exit even if this thread is running
+        keep_alive_thread.start()
+        logger.info("Keep-alive background thread started.")
     
 except Exception as e:
     logger.error(f"Failed to initialize bot: {e}")
-    # Continue running Flask app even if bot initialization fails
-    # This allows for debugging via the status endpoint
+    # The app will still run, and the status endpoint will show the initialization error.
 
 if __name__ == "__main__":
     # Run Flask app on port 5000 for local testing
     port = int(os.getenv('PORT', 5000))
     logger.info(f"Starting Flask TRX Sweep Bot on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
-
