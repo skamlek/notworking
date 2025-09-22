@@ -16,6 +16,7 @@ import requests
 from flask import Flask, request, jsonify
 from tronpy import Tron
 from tronpy.keys import PrivateKey
+from logging import getLogger
 
 # Configure simple logging with reduced verbosity for production
 logging.basicConfig(
@@ -215,7 +216,6 @@ def initialize_bot():
 
 def verify_webhook_signature(headers, payload_bytes, secret):
     """Verify Tatum webhook signature."""
-    # Tatum sends the signature in the 'x-payload-signature' header.
     signature = headers.get('x-payload-signature')
 
     if not signature or not secret:
@@ -223,10 +223,7 @@ def verify_webhook_signature(headers, payload_bytes, secret):
         return False
 
     try:
-        # The secret is your Tatum API key.
         secret_bytes = secret.encode('utf-8')
-        
-        # The signature is a simple HMAC-SHA256 of the raw request body.
         expected_signature = hmac.new(secret_bytes, payload_bytes, hashlib.sha256).hexdigest()
 
         if hmac.compare_digest(signature, expected_signature):
@@ -248,24 +245,20 @@ def process_webhook_payload(payload_bytes):
         payload_str = payload_bytes.decode('utf-8')
         data = json.loads(payload_str)
         
-        # Extract data from the real Tatum payload
         monitored_address = data.get('address')
         chain = data.get('chain')
         tx_id = data.get('txId')
         amount_str = data.get('amount', '0')
         
-        # Convert amount to a float to check if it's positive
         try:
             amount = float(amount_str)
         except (ValueError, TypeError):
             amount = 0.0
 
-        # Check if it's an incoming transaction to our target address on the Tron mainnet
         if chain == 'tron-mainnet' and monitored_address == target_addr and amount > 0:
             logger.info(f"Tatum: Incoming TRX transfer detected to target address: {target_addr}, txid: {tx_id}")
             return {'detected': True, 'txid': tx_id}
         
-        # This handles the initial "ping" or test from Tatum
         if data.get('subscriptionType') == 'ADDRESS_EVENT':
              logger.info("Tatum test notification received and processed.")
              return {'detected': False, 'txid': None, 'reason': 'test_notification'}
@@ -276,7 +269,7 @@ def process_webhook_payload(payload_bytes):
         logger.warning(f"Payload was not valid JSON, ignoring. Error: {e}")
         return {'detected': False, 'txid': None}
     except Exception as e:
-        logger.error(f"Error processing Tatum webhook payload: {e}")
+        logger.error(f"Error processing webhook payload: {e}")
         return {'detected': False, 'txid': None}
 
 def manage_processed_txids_cache(txid):
@@ -300,7 +293,6 @@ def keep_alive():
                 requests.get(health_url, timeout=10)
         except Exception as e:
             logger.error(f"Keep-alive: An unexpected error occurred: {e}")
-        # Sleep for 10 minutes (600 seconds)
         time.sleep(600)
 
 # Flask Routes
@@ -321,7 +313,7 @@ def health():
     """Simple health check endpoint for monitoring services"""
     return jsonify({
         'status': 'healthy', 'timestamp': time.time(), 'provider': 'tatum',
-        'version': '2.0-tatum'
+        'version': '2.1-fixed'
     })
 
 @app.route('/webhook-v2', methods=['POST', 'GET'])
@@ -356,7 +348,6 @@ def webhook():
             else:
                 return jsonify({'status': 'no_action', 'message': f'Sweep not performed: {sweep_result["reason"]}'})
         else:
-            # This will now correctly handle the test notification from Tatum
             message = result.get('reason', 'No relevant transaction detected')
             return jsonify({'status': 'ok', 'message': message})
             
