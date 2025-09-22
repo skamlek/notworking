@@ -6,7 +6,6 @@ Optimized to prevent worker timeouts and memory issues on free hosting tiers
 """
 
 import os
-import hashlib
 import hmac
 import json
 import logging
@@ -183,6 +182,7 @@ def sweep_trx_async(client_instance, p_key, t_addr, s_wallet, m_trx_left, p_id):
         logger.error(f"Error during sweep: {e}")
         return {'success': False, 'reason': 'exception', 'txid': None, 'error': str(e)}
 
+# MODIFICATION: Added super-sanitization of the secret token
 def initialize_bot():
     """Initialize bot configuration and validate setup"""
     global client, private_key, target_addr, safe_wallet, webhook_security_token, min_trx_left, permission_id
@@ -192,7 +192,19 @@ def initialize_bot():
     target_addr = os.getenv('TARGET_ADDR', '').strip()
     safe_wallet = os.getenv('SAFE_WALLET', '').strip()
     private_key_hex = os.getenv('PRIVATE_KEY', '').strip()
-    webhook_security_token = os.getenv('WEBHOOK_SECURITY_TOKEN', '').strip()
+    
+    # --- Super-sanitize the secret token ---
+    raw_secret = os.getenv('WEBHOOK_SECURITY_TOKEN', '')
+    # 1. Remove leading/trailing whitespace
+    sanitized_secret = raw_secret.strip()
+    # 2. Remove potential UTF-8 Byte Order Mark (BOM)
+    sanitized_secret = sanitized_secret.lstrip('\ufeff')
+    webhook_security_token = sanitized_secret
+    logger.info(f"Sanitized Webhook Security Token. Original length: {len(raw_secret)}, Sanitized length: {len(webhook_security_token)}")
+    # Log a representation that makes invisible characters visible
+    logger.info(f"Sanitized Token repr(): {repr(webhook_security_token)}")
+    # --- End of sanitization ---
+
     min_trx_left = float(os.getenv('MIN_TRX_LEFT', '0.3'))
     permission_id = int(os.getenv('PERMISSION_ID', '4'))
     
@@ -215,51 +227,51 @@ def initialize_bot():
     logger.info("Bot initialized successfully")
     return True
 
-# MODIFICATION: Added detailed logging to the signature verification
-def verify_webhook_signature(payload_bytes, signature, secret):
-    """Verify webhook signature with detailed logging for debugging."""
-    if not signature or not secret:
-        logger.warning("Signature or secret is missing.")
+# MODIFICATION: Implemented official QuickNode signature recipe
+def verify_webhook_signature(headers, payload_bytes, secret):
+    """Verify QuickNode webhook signature using the official nonce + timestamp + body recipe."""
+    signature = headers.get('X-Qn-Signature')
+    nonce = headers.get('X-Qn-Nonce')
+    timestamp = headers.get('X-Qn-Timestamp')
+
+    if not signature or not secret or not nonce or not timestamp:
+        logger.warning("Signature, secret, nonce, or timestamp is missing for verification.")
         return False
     
     try:
-        # The payload must be in bytes
-        if not isinstance(payload_bytes, bytes):
-            logger.error("Payload provided to verify_webhook_signature was not in bytes.")
-            return False
-
         secret_bytes = secret.encode('utf-8')
         
-        # Calculate our expected signature
-        expected_hex = hmac.new(secret_bytes, payload_bytes, hashlib.sha256).hexdigest()
+        # This is the official recipe from QuickNode's documentation
+        message_string = f"{nonce}{timestamp}{payload_bytes.decode('utf-8')}"
+        message_bytes = message_string.encode('utf-8')
         
-        # Get the signature from the header, removing the 'sha256=' prefix if it exists
+        expected_signature = hmac.new(secret_bytes, message_bytes, hashlib.sha256).hexdigest()
+        
         received_signature = signature
         if received_signature.startswith('sha256='):
             received_signature = received_signature[7:]
 
-        # Compare the signatures
-        is_valid = hmac.compare_digest(received_signature, expected_hex)
+        is_valid = hmac.compare_digest(received_signature, expected_signature)
         
         if is_valid:
-            logger.info("Webhook signature verification successful.")
+            logger.info("Webhook signature verified successfully using official [nonce+timestamp+body] recipe.")
+            return True
         else:
-            # Log details for debugging if verification fails
-            logger.warning("!!! Webhook signature verification FAILED !!!")
+            # If it fails, log everything for the final debugging step
+            logger.warning("!!! Webhook signature verification FAILED using official [nonce+timestamp+body] recipe !!!")
             logger.warning(f"Received Signature: {received_signature}")
-            logger.warning(f"Expected Signature: {expected_hex}")
-            logger.warning(f"Payload (bytes) used for calculation: {payload_bytes}")
-        
-        return is_valid
+            logger.warning(f"Expected Signature: {expected_signature}")
+            logger.warning(f"Data signed (string): {repr(message_string)}") # Use repr to see hidden chars
+            return False
         
     except Exception as e:
         logger.error(f"Error during signature verification: {e}")
         return False
 
+
 def process_webhook_payload(payload_bytes):
     """Process webhook payload to detect Tron transactions to target address"""
     try:
-        # Decode the byte payload to a string to be parsed as JSON
         payload_str = payload_bytes.decode('utf-8')
         data = json.loads(payload_str)
         txid = None
@@ -288,7 +300,6 @@ def process_webhook_payload(payload_bytes):
         return {'detected': False, 'txid': None}
         
     except (json.JSONDecodeError, UnicodeDecodeError):
-        # This handles cases where the body is not valid JSON, like the '[]' check
         logger.info("Payload was not a valid JSON object, likely a check request. Ignoring.")
         return {'detected': False, 'txid': None}
     except Exception as e:
@@ -336,7 +347,7 @@ def health():
     """Simple health check endpoint for monitoring services"""
     return jsonify({
         'status': 'healthy', 'timestamp': time.time(), 'optimization': 'memory_managed',
-        'version': '1.4' # Incremented version for the new signature logging
+        'version': '1.6' # Incremented version for the official recipe
     })
 
 @app.route('/webhook-v2', methods=['POST', 'GET'])
@@ -347,10 +358,9 @@ def webhook():
     
     try:
         payload_bytes = request.get_data()
-        signature = request.headers.get('X-Signature') or request.headers.get('X-Qn-Signature')
         
         if webhook_security_token:
-            if not verify_webhook_signature(payload_bytes, signature, webhook_security_token):
+            if not verify_webhook_signature(request.headers, payload_bytes, webhook_security_token):
                 return jsonify({'error': 'Invalid signature'}), 401
         else:
             logger.warning("Webhook security token not configured - accepting all requests")
@@ -372,7 +382,8 @@ def webhook():
             else:
                 return jsonify({'status': 'no_action', 'message': f'Sweep not performed: {sweep_result["reason"]}'})
         else:
-            return jsonify({'status': 'ignored', 'message': 'No relevant transaction detected or just a check request'})
+            # This now correctly returns a 200 OK for the check request, as verification passes
+            return jsonify({'status': 'ok', 'message': 'Check request successful or no relevant transaction detected'})
             
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
