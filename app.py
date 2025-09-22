@@ -3,6 +3,7 @@
 TRX Sweep Bot Flask Application - Optimized for Render Free Tier
 Webhook-based TRX sweeping bot that responds to Tatum webhook notifications.
 Uses a reliable RPC to prevent rate-limiting and is optimized for performance.
+Version: 2.3
 """
 
 import os
@@ -74,7 +75,6 @@ def validate_env_vars():
         logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         exit(1)
     
-    # Further validation for format and values
     try:
         target_addr_val = os.getenv('TARGET_ADDR', '').strip()
         if not (target_addr_val.startswith('T') and len(target_addr_val) == 34):
@@ -87,7 +87,7 @@ def validate_env_vars():
         private_key_val = os.getenv('PRIVATE_KEY', '').strip().lstrip('0x')
         if len(private_key_val) != 64:
             raise ValueError("Invalid PRIVATE_KEY format: must be 64 hex characters")
-        PrivateKey(bytes.fromhex(private_key_val)) # This will raise an error if invalid
+        PrivateKey(bytes.fromhex(private_key_val))
 
         float(os.getenv('MIN_TRX_LEFT', '0.3'))
         int(os.getenv('PERMISSION_ID', '4'))
@@ -154,8 +154,7 @@ def initialize_bot():
     min_trx_left = float(os.getenv('MIN_TRX_LEFT', '0.3'))
     permission_id = int(os.getenv('PERMISSION_ID', '4'))
     
-    # **FIX FOR RATE LIMITING**: Use Tatum's Tron RPC endpoint
-    tatum_api_key = webhook_security_token # Your Tatum API key is used for both auth and RPC
+    tatum_api_key = webhook_security_token
     tron_rpc_url = f"https://api.tatum.io/v3/blockchain/node/tron/{tatum_api_key}"
     provider = HTTPProvider(endpoint_uri=tron_rpc_url )
     client = Tron(provider=provider)
@@ -220,7 +219,7 @@ def manage_processed_txids_cache(txid):
 def keep_alive():
     """Pings the app's health endpoint to keep the Render instance alive."""
     while True:
-        time.sleep(600) # Wait 10 minutes
+        time.sleep(600)
         try:
             render_url = os.getenv('RENDER_EXTERNAL_URL')
             if render_url:
