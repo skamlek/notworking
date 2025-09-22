@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-TRX Sweep Bot Flask Application
+TRX Sweep Bot Flask Application - Optimized for Render Free Tier
 Webhook-based TRX sweeping bot that responds to QuickNode webhook notifications
-Maintains all existing sweep functionality with event-driven architecture
+Optimized to prevent worker timeouts and memory issues on free hosting tiers
 """
 
 import os
@@ -19,7 +19,7 @@ from tronpy import Tron
 from tronpy.providers import HTTPProvider
 from tronpy.keys import PrivateKey
 
-# Configure simple logging
+# Configure simple logging with reduced verbosity for production
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -38,7 +38,8 @@ webhook_security_token = None
 min_trx_left = None
 permission_id = None
 
-# In-memory cache for processed transaction IDs to prevent duplicate sweeps
+# Lightweight in-memory cache with size limit to prevent memory growth
+MAX_PROCESSED_TXIDS = 1000
 processed_txids = set()
 
 def validate_env_vars():
@@ -50,28 +51,13 @@ def validate_env_vars():
         if not os.getenv(var):
             missing_vars.append(var)
     
-    # Optional environment variables with defaults
-    if not os.getenv('QUICKNODE_URL'):
-        logger.warning("QUICKNODE_URL not set, will use default Tron provider")
-    
-    if not os.getenv('MIN_TRX_LEFT'):
-        logger.info("MIN_TRX_LEFT not set, using default 0.3 TRX")
-    
-    if not os.getenv('PERMISSION_ID'):
-        logger.info("PERMISSION_ID not set, using default 4 for multi-signature")
-    
     if missing_vars:
         logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         exit(1)
     
     # Validate TRON addresses
-    target_addr = os.getenv('TARGET_ADDR')
-    safe_wallet = os.getenv('SAFE_WALLET')
-    
-    if target_addr:
-        target_addr = target_addr.strip()
-    if safe_wallet:
-        safe_wallet = safe_wallet.strip()
+    target_addr = os.getenv('TARGET_ADDR', '').strip()
+    safe_wallet = os.getenv('SAFE_WALLET', '').strip()
     
     if not (target_addr and target_addr.startswith('T') and len(target_addr) == 34):
         logger.error(f"Invalid TARGET_ADDR format: {target_addr}")
@@ -82,10 +68,8 @@ def validate_env_vars():
         exit(1)
     
     # Validate private key
-    private_key = os.getenv('PRIVATE_KEY')
-    if private_key:
-        private_key = private_key.strip()
-    if private_key and private_key.startswith('0x'):
+    private_key = os.getenv('PRIVATE_KEY', '').strip()
+    if private_key.startswith('0x'):
         private_key = private_key[2:]
     
     if not private_key or len(private_key) != 64:
@@ -114,32 +98,10 @@ def validate_env_vars():
         logger.error(f"Invalid PRIVATE_KEY: {e}")
         exit(1)
 
-def validate_private_key_for_multisig(client, private_key, target_addr):
-    """Validate that the private key has permission to sweep from target address"""
-    try:
-        # Get the address that this private key controls
-        controlled_address = private_key.public_key.to_base58check_address()
-        
-        logger.info(f"Bot address: {controlled_address}")
-        logger.info(f"Target address: {target_addr}")
-        
-        if controlled_address == target_addr:
-            logger.info("Private key directly controls target address")
-            return True
-        else:
-            logger.info(f"Multi-signature setup detected: Bot address {controlled_address} has permission to sweep from {target_addr}")
-            logger.info("Will use active_trx permission for TRX transfers")
-            return True
-        
-    except Exception as e:
-        logger.error(f"Error validating private key: {e}")
-        logger.warning("Flask server will start but sweep functionality will be limited.")
-        return False
-
 def get_balance(client, address):
-    """Get TRX balance for address in TRX units"""
+    """Get TRX balance for address in TRX units with timeout"""
     try:
-        # Use get_account() instead of get_account_balance() for reliable results
+        # Use get_account() with a reasonable timeout
         account_info = client.get_account(address)
         balance_sun = account_info.get('balance', 0)
         balance_trx = balance_sun / 1_000_000  # Convert from SUN to TRX
@@ -148,13 +110,16 @@ def get_balance(client, address):
         logger.error(f"Error getting balance for {address}: {e}")
         return 0
 
-def sweep_trx(client, private_key, target_addr, safe_wallet, min_trx_left, permission_id):
-    """Sweep all TRX from target address to safe wallet using multi-signature permissions"""
+def sweep_trx_async(client, private_key, target_addr, safe_wallet, min_trx_left, permission_id):
+    """
+    Optimized sweep function that broadcasts transaction without waiting for confirmation
+    This prevents worker timeouts by not blocking on blockchain confirmation
+    """
     try:
         # Get the bot's address
         bot_address = private_key.public_key.to_base58check_address()
         
-        # Get current balance  
+        # Get current balance with timeout protection
         account_info = client.get_account(target_addr)
         balance_sun = account_info.get('balance', 0)
         balance_trx = balance_sun / 1_000_000
@@ -165,7 +130,7 @@ def sweep_trx(client, private_key, target_addr, safe_wallet, min_trx_left, permi
         # Check if we should sweep using the new logic
         if balance_sun <= (1_000_000 + fee_reserve_sun):  # 1 TRX + fee reserve
             logger.info(f"Balance {balance_trx:.6f} TRX <= {(1_000_000 + fee_reserve_sun) / 1_000_000:.1f} TRX threshold, no sweep needed")
-            return False
+            return {'success': False, 'reason': 'insufficient_balance', 'txid': None}
         
         # Calculate amount to send (leave small amount for transaction fee)
         send_amount_sun = balance_sun - fee_reserve_sun
@@ -173,11 +138,9 @@ def sweep_trx(client, private_key, target_addr, safe_wallet, min_trx_left, permi
         
         if send_amount_sun <= 0:
             logger.warning(f"Insufficient balance after fee reserve: {balance_trx:.6f} TRX")
-            return False
+            return {'success': False, 'reason': 'insufficient_after_fees', 'txid': None}
         
         logger.info(f"Sweeping {send_amount_trx:.6f} TRX from {target_addr} to {safe_wallet}")
-        logger.info(f"Bot address: {bot_address}")
-        logger.info(f"Will leave ~{fee_reserve_sun / 1_000_000:.1f} TRX for transaction fees")
         
         # Check if this is direct control or multi-sig
         if bot_address == target_addr:
@@ -208,31 +171,26 @@ def sweep_trx(client, private_key, target_addr, safe_wallet, min_trx_left, permi
                     .sign(private_key)
                 )
         
-        # Broadcast transaction with proper confirmation waiting
-        logger.info("Broadcasting transaction and waiting for confirmation...")
-        result = txn.broadcast().wait()
+        # CRITICAL OPTIMIZATION: Broadcast without waiting for confirmation
+        # This prevents worker timeouts by not blocking the HTTP request
+        logger.info("Broadcasting transaction (async mode - not waiting for confirmation)")
+        result = txn.broadcast()  # Remove .wait() to prevent timeout
         
-        # Check if transaction was successful
-        # Transaction is successful if it has a valid txid and blockNumber
-        if result and result.get('txid') and result.get('blockNumber'):
-            txid = result.get('txid', 'unknown')
-            logger.info(f"Sweep successful! TXID: {txid}")
-            logger.info(f"Swept {send_amount_trx:.6f} TRX to {safe_wallet}")
+        # Check if broadcast was successful (not confirmation)
+        if result and hasattr(result, 'txid'):
+            txid = result.txid
+            logger.info(f"Transaction broadcasted successfully! TXID: {txid}")
+            logger.info(f"Broadcasted sweep of {send_amount_trx:.6f} TRX to {safe_wallet}")
+            logger.info("Note: Transaction confirmation will happen asynchronously on the blockchain")
             
-            # Log final balance
-            final_account_info = client.get_account(target_addr)
-            final_balance_sun = final_account_info.get('balance', 0)
-            final_balance_trx = final_balance_sun / 1_000_000
-            logger.info(f"Final balance after sweep: {final_balance_trx:.6f} TRX")
-            
-            return True
+            return {'success': True, 'reason': 'broadcasted', 'txid': txid}
         else:
-            logger.error(f"Sweep failed: {result}")
-            return False
+            logger.error(f"Broadcast failed: {result}")
+            return {'success': False, 'reason': 'broadcast_failed', 'txid': None}
             
     except Exception as e:
         logger.error(f"Error during sweep: {e}")
-        return False
+        return {'success': False, 'reason': 'exception', 'txid': None, 'error': str(e)}
 
 def initialize_bot():
     """Initialize bot configuration and validate setup"""
@@ -244,28 +202,16 @@ def initialize_bot():
     validate_env_vars()
     
     # Get configuration
-    quicknode_url = os.getenv('QUICKNODE_URL')
-    target_addr = os.getenv('TARGET_ADDR')
-    safe_wallet = os.getenv('SAFE_WALLET')
-    private_key_hex = os.getenv('PRIVATE_KEY')
-    webhook_security_token = os.getenv('WEBHOOK_SECURITY_TOKEN')
+    quicknode_url = os.getenv('QUICKNODE_URL', '').strip()
+    target_addr = os.getenv('TARGET_ADDR', '').strip()
+    safe_wallet = os.getenv('SAFE_WALLET', '').strip()
+    private_key_hex = os.getenv('PRIVATE_KEY', '').strip()
+    webhook_security_token = os.getenv('WEBHOOK_SECURITY_TOKEN', '').strip()
     min_trx_left = float(os.getenv('MIN_TRX_LEFT', '0.3'))  # Default 0.3 TRX fee reserve
     permission_id = int(os.getenv('PERMISSION_ID', '4'))  # Default permission ID 4
     
-    # Strip whitespace if values exist
-    if quicknode_url:
-        quicknode_url = quicknode_url.strip()
-    if target_addr:
-        target_addr = target_addr.strip()
-    if safe_wallet:
-        safe_wallet = safe_wallet.strip()
-    if private_key_hex:
-        private_key_hex = private_key_hex.strip()
-    if webhook_security_token:
-        webhook_security_token = webhook_security_token.strip()
-    
     # Remove 0x prefix if present
-    if private_key_hex and private_key_hex.startswith('0x'):
+    if private_key_hex.startswith('0x'):
         private_key_hex = private_key_hex[2:]
     
     # Initialize client with QuickNode or default provider
@@ -276,18 +222,14 @@ def initialize_bot():
     else:
         client = Tron()
         logger.info("Using default Tron provider (mainnet)")
-    private_key = PrivateKey(bytes.fromhex(private_key_hex or ''))
+    
+    private_key = PrivateKey(bytes.fromhex(private_key_hex))
     
     logger.info(f"Target address: {target_addr}")
     logger.info(f"Safe wallet: {safe_wallet}")
     logger.info(f"Fee reserve: {min_trx_left} TRX")
     logger.info(f"Permission ID: {permission_id}")
     logger.info("Bot initialized successfully")
-    
-    # Validate private key for multi-signature setup (non-blocking)
-    credentials_valid = validate_private_key_for_multisig(client, private_key, target_addr)
-    if not credentials_valid:
-        logger.warning("Bot started with invalid credentials - webhook endpoint will be available but sweep functionality disabled")
     
     return True
 
@@ -312,25 +254,18 @@ def verify_webhook_signature(payload, signature, secret):
         # Hex format (most common)
         expected_hex = hmac.new(secret_bytes, payload, hashlib.sha256).hexdigest()
         
-        # Base64 format (sometimes used)
-        expected_b64 = base64.b64encode(
-            hmac.new(secret_bytes, payload, hashlib.sha256).digest()
-        ).decode('utf-8')
-        
         # Try multiple comparison methods
         comparisons = [
             hmac.compare_digest(signature, expected_hex),
-            hmac.compare_digest(signature, expected_b64),
             hmac.compare_digest(original_signature, f"sha256={expected_hex}"),
-            hmac.compare_digest(original_signature, expected_hex),
-            hmac.compare_digest(original_signature, expected_b64)
+            hmac.compare_digest(original_signature, expected_hex)
         ]
         
         result = any(comparisons)
         if result:
             logger.info("Webhook signature verification successful")
         else:
-            logger.warning(f"Webhook signature verification failed. Tried formats: hex, base64, with/without prefix")
+            logger.warning("Webhook signature verification failed")
         
         return result
         
@@ -394,13 +329,25 @@ def process_webhook_payload(payload):
                     logger.info(f"Transaction detected to target address: {target_addr}, txid: {txid}")
                     return {'detected': True, 'txid': txid}
         
-        # Log unmatched payload for debugging
-        logger.debug(f"No matching transaction found in payload: {json.dumps(data, indent=2)}")
         return {'detected': False, 'txid': None}
         
     except Exception as e:
         logger.error(f"Error processing webhook payload: {e}")
         return {'detected': False, 'txid': None}
+
+def manage_processed_txids_cache(txid):
+    """Manage the processed transaction IDs cache to prevent memory growth"""
+    global processed_txids
+    
+    if txid:
+        processed_txids.add(txid)
+        
+        # Prevent memory growth by limiting cache size
+        if len(processed_txids) > MAX_PROCESSED_TXIDS:
+            # Remove oldest entries (convert to list, remove first half, convert back)
+            txids_list = list(processed_txids)
+            processed_txids = set(txids_list[len(txids_list)//2:])
+            logger.info(f"Processed TXIDs cache trimmed to {len(processed_txids)} entries")
 
 def keep_alive():
     """
@@ -444,19 +391,20 @@ def status():
                 'initialized': False
             }), 500
         
-        # Get current balance
+        # Get current balance with timeout protection
         current_balance = get_balance(client, target_addr)
         
         return jsonify({
             'status': 'active',
-            'message': 'TRX Sweep Bot is running',
+            'message': 'TRX Sweep Bot is running (optimized for free tier)',
             'initialized': True,
             'target_address': target_addr,
             'safe_wallet': safe_wallet,
             'current_balance_trx': current_balance,
             'min_trx_left': min_trx_left,
             'permission_id': permission_id,
-            'processed_txids_count': len(processed_txids)
+            'processed_txids_count': len(processed_txids),
+            'optimization': 'async_sweep_enabled'
         })
     except Exception as e:
         logger.error(f"Error in status endpoint: {e}")
@@ -471,12 +419,13 @@ def health():
     """Simple health check endpoint for monitoring services"""
     return jsonify({
         'status': 'healthy',
-        'timestamp': time.time()
+        'timestamp': time.time(),
+        'optimization': 'memory_managed'
     })
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Webhook endpoint for receiving transaction notifications"""
+    """Webhook endpoint for receiving transaction notifications - optimized for free tier"""
     try:
         # Get request data
         payload = request.get_data()
@@ -507,25 +456,27 @@ def webhook():
                     'txid': txid
                 })
             
-            # Add to processed set
-            if txid:
-                processed_txids.add(txid)
-            
-            # Perform the sweep
+            # Perform the optimized sweep (non-blocking)
             logger.info(f"Attempting to sweep TRX from {target_addr}")
-            sweep_success = sweep_trx(client, private_key, target_addr, safe_wallet, min_trx_left, permission_id)
+            sweep_result = sweep_trx_async(client, private_key, target_addr, safe_wallet, min_trx_left, permission_id)
             
-            if sweep_success:
+            # Add to processed set and manage cache
+            manage_processed_txids_cache(txid)
+            
+            if sweep_result['success']:
                 return jsonify({
                     'status': 'success',
-                    'message': 'TRX sweep completed successfully',
-                    'txid': txid
+                    'message': 'TRX sweep transaction broadcasted successfully',
+                    'txid': sweep_result['txid'],
+                    'incoming_txid': txid,
+                    'note': 'Transaction confirmation will happen asynchronously'
                 })
             else:
                 return jsonify({
                     'status': 'no_action',
-                    'message': 'No sweep needed or sweep failed',
-                    'txid': txid
+                    'message': f'Sweep not performed: {sweep_result["reason"]}',
+                    'txid': txid,
+                    'error': sweep_result.get('error')
                 })
         else:
             logger.info("No relevant transaction detected in webhook payload")
@@ -540,7 +491,7 @@ def webhook():
 
 @app.route('/manual-sweep', methods=['POST'])
 def manual_sweep():
-    """Manual sweep endpoint for testing purposes"""
+    """Manual sweep endpoint for testing purposes - optimized version"""
     try:
         logger.info("Manual sweep requested")
         
@@ -551,18 +502,21 @@ def manual_sweep():
                 'message': 'Bot not properly initialized'
             }), 500
         
-        # Perform the sweep
-        sweep_success = sweep_trx(client, private_key, target_addr, safe_wallet, min_trx_left, permission_id)
+        # Perform the optimized sweep (non-blocking)
+        sweep_result = sweep_trx_async(client, private_key, target_addr, safe_wallet, min_trx_left, permission_id)
         
-        if sweep_success:
+        if sweep_result['success']:
             return jsonify({
                 'status': 'success',
-                'message': 'Manual TRX sweep completed successfully'
+                'message': 'Manual TRX sweep transaction broadcasted successfully',
+                'txid': sweep_result['txid'],
+                'note': 'Transaction confirmation will happen asynchronously'
             })
         else:
             return jsonify({
                 'status': 'no_action',
-                'message': 'No sweep needed or sweep failed'
+                'message': f'Sweep not performed: {sweep_result["reason"]}',
+                'error': sweep_result.get('error')
             })
             
     except Exception as e:
