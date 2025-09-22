@@ -182,7 +182,6 @@ def sweep_trx_async(client_instance, p_key, t_addr, s_wallet, m_trx_left, p_id):
         logger.error(f"Error during sweep: {e}")
         return {'success': False, 'reason': 'exception', 'txid': None, 'error': str(e)}
 
-# MODIFICATION: Added super-sanitization of the secret token
 def initialize_bot():
     """Initialize bot configuration and validate setup"""
     global client, private_key, target_addr, safe_wallet, webhook_security_token, min_trx_left, permission_id
@@ -193,17 +192,11 @@ def initialize_bot():
     safe_wallet = os.getenv('SAFE_WALLET', '').strip()
     private_key_hex = os.getenv('PRIVATE_KEY', '').strip()
     
-    # --- Super-sanitize the secret token ---
     raw_secret = os.getenv('WEBHOOK_SECURITY_TOKEN', '')
-    # 1. Remove leading/trailing whitespace
-    sanitized_secret = raw_secret.strip()
-    # 2. Remove potential UTF-8 Byte Order Mark (BOM)
-    sanitized_secret = sanitized_secret.lstrip('\ufeff')
+    sanitized_secret = raw_secret.strip().lstrip('\ufeff')
     webhook_security_token = sanitized_secret
     logger.info(f"Sanitized Webhook Security Token. Original length: {len(raw_secret)}, Sanitized length: {len(webhook_security_token)}")
-    # Log a representation that makes invisible characters visible
     logger.info(f"Sanitized Token repr(): {repr(webhook_security_token)}")
-    # --- End of sanitization ---
 
     min_trx_left = float(os.getenv('MIN_TRX_LEFT', '0.3'))
     permission_id = int(os.getenv('PERMISSION_ID', '4'))
@@ -227,9 +220,11 @@ def initialize_bot():
     logger.info("Bot initialized successfully")
     return True
 
-# MODIFICATION: Implemented official QuickNode signature recipe
+# FINAL FIX: Added missing 'import hashlib'
 def verify_webhook_signature(headers, payload_bytes, secret):
     """Verify QuickNode webhook signature using the official nonce + timestamp + body recipe."""
+    import hashlib  # <-- THIS WAS THE MISSING LINE
+    
     signature = headers.get('X-Qn-Signature')
     nonce = headers.get('X-Qn-Nonce')
     timestamp = headers.get('X-Qn-Timestamp')
@@ -241,7 +236,6 @@ def verify_webhook_signature(headers, payload_bytes, secret):
     try:
         secret_bytes = secret.encode('utf-8')
         
-        # This is the official recipe from QuickNode's documentation
         message_string = f"{nonce}{timestamp}{payload_bytes.decode('utf-8')}"
         message_bytes = message_string.encode('utf-8')
         
@@ -257,11 +251,10 @@ def verify_webhook_signature(headers, payload_bytes, secret):
             logger.info("Webhook signature verified successfully using official [nonce+timestamp+body] recipe.")
             return True
         else:
-            # If it fails, log everything for the final debugging step
             logger.warning("!!! Webhook signature verification FAILED using official [nonce+timestamp+body] recipe !!!")
             logger.warning(f"Received Signature: {received_signature}")
             logger.warning(f"Expected Signature: {expected_signature}")
-            logger.warning(f"Data signed (string): {repr(message_string)}") # Use repr to see hidden chars
+            logger.warning(f"Data signed (string): {repr(message_string)}")
             return False
         
     except Exception as e:
@@ -347,7 +340,7 @@ def health():
     """Simple health check endpoint for monitoring services"""
     return jsonify({
         'status': 'healthy', 'timestamp': time.time(), 'optimization': 'memory_managed',
-        'version': '1.6' # Incremented version for the official recipe
+        'version': '1.7' # Final version with the bug fix
     })
 
 @app.route('/webhook-v2', methods=['POST', 'GET'])
@@ -382,7 +375,6 @@ def webhook():
             else:
                 return jsonify({'status': 'no_action', 'message': f'Sweep not performed: {sweep_result["reason"]}'})
         else:
-            # This now correctly returns a 200 OK for the check request, as verification passes
             return jsonify({'status': 'ok', 'message': 'Check request successful or no relevant transaction detected'})
             
     except Exception as e:
