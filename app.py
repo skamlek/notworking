@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 # Initialize Flask app
 app = Flask(__name__)
 
+# Initialize the bot when the app is loaded (for Gunicorn)
+initialize_bot()
+
 # Global variables for bot configuration
 client = None
 private_key = None
@@ -569,8 +572,7 @@ def manual_sweep():
         return jsonify({'error': 'Manual sweep failed', 'details': str(e)}), 500
 
 if __name__ == "__main__":
-    # Initialize the bot
-    initialize_bot()
+
     
     # Run Flask app on port 5000 for Replit environment
     port = int(os.getenv('PORT', 5000))
