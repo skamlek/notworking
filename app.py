@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
 TRX Sweep Bot Flask Application - Optimized for Render Free Tier
-Webhook-based TRX sweeping bot that responds to QuickNode webhook notifications
-Optimized to prevent worker timeouts and memory issues on free hosting tiers
+Webhook-based TRX sweeping bot that responds to Tatum webhook notifications.
+Optimized to prevent worker timeouts and memory issues on free hosting tiers.
 """
 
 import os
 import hmac
 import json
 import logging
-import base64
+import hashlib
 import time
 import threading
 import requests
 from flask import Flask, request, jsonify
 from tronpy import Tron
-from tronpy.providers import HTTPProvider
 from tronpy.keys import PrivateKey
 
 # Configure simple logging with reduced verbosity for production
@@ -23,7 +22,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
+logger = getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -68,6 +67,7 @@ processed_txids = set()
 
 def validate_env_vars():
     """Validate required environment variables"""
+    # WEBHOOK_SECURITY_TOKEN is your Tatum API Key
     required_vars = ['TARGET_ADDR', 'SAFE_WALLET', 'PRIVATE_KEY', 'WEBHOOK_SECURITY_TOKEN']
     missing_vars = []
     
@@ -185,32 +185,25 @@ def sweep_trx_async(client_instance, p_key, t_addr, s_wallet, m_trx_left, p_id):
 def initialize_bot():
     """Initialize bot configuration and validate setup"""
     global client, private_key, target_addr, safe_wallet, webhook_security_token, min_trx_left, permission_id
-    logger.info("Initializing TRX Sweep Bot Flask Application...")
+    logger.info("Initializing TRX Sweep Bot for Tatum Webhooks...")
     validate_env_vars()
-    quicknode_url = os.getenv('QUICKNODE_URL', '').strip()
+    
     target_addr = os.getenv('TARGET_ADDR', '').strip()
     safe_wallet = os.getenv('SAFE_WALLET', '').strip()
     private_key_hex = os.getenv('PRIVATE_KEY', '').strip()
     
-    raw_secret = os.getenv('WEBHOOK_SECURITY_TOKEN', '')
-    sanitized_secret = raw_secret.strip().lstrip('\ufeff')
-    webhook_security_token = sanitized_secret
-    logger.info(f"Sanitized Webhook Security Token. Original length: {len(raw_secret)}, Sanitized length: {len(webhook_security_token)}")
-    logger.info(f"Sanitized Token repr(): {repr(webhook_security_token)}")
-
+    # The WEBHOOK_SECURITY_TOKEN is your Tatum API Key
+    webhook_security_token = os.getenv('WEBHOOK_SECURITY_TOKEN', '').strip()
+    
     min_trx_left = float(os.getenv('MIN_TRX_LEFT', '0.3'))
     permission_id = int(os.getenv('PERMISSION_ID', '4'))
     
     if private_key_hex.startswith('0x'):
         private_key_hex = private_key_hex[2:]
     
-    if quicknode_url:
-        provider = HTTPProvider(api_key='', endpoint_uri=quicknode_url)
-        client = Tron(provider=provider)
-        logger.info("Using QuickNode as HTTP provider")
-    else:
-        client = Tron()
-        logger.info("Using default Tron provider (mainnet)")
+    # Use the default Tron provider for sending transactions
+    client = Tron()
+    logger.info("Using default Tron provider (mainnet)")
     
     private_key = PrivateKey(bytes.fromhex(private_key_hex))
     logger.info(f"Target address: {target_addr}")
@@ -220,83 +213,70 @@ def initialize_bot():
     logger.info("Bot initialized successfully")
     return True
 
-# FINAL FIX: Added missing 'import hashlib'
 def verify_webhook_signature(headers, payload_bytes, secret):
-    """Verify QuickNode webhook signature using the official nonce + timestamp + body recipe."""
-    import hashlib  # <-- THIS WAS THE MISSING LINE
-    
-    signature = headers.get('X-Qn-Signature')
-    nonce = headers.get('X-Qn-Nonce')
-    timestamp = headers.get('X-Qn-Timestamp')
+    """Verify Tatum webhook signature."""
+    # Tatum sends the signature in the 'x-payload-signature' header.
+    signature = headers.get('x-payload-signature')
 
-    if not signature or not secret or not nonce or not timestamp:
-        logger.warning("Signature, secret, nonce, or timestamp is missing for verification.")
+    if not signature or not secret:
+        logger.warning("Tatum signature or secret (API Key) is missing for verification.")
         return False
-    
+
     try:
+        # The secret is your Tatum API key.
         secret_bytes = secret.encode('utf-8')
         
-        message_string = f"{nonce}{timestamp}{payload_bytes.decode('utf-8')}"
-        message_bytes = message_string.encode('utf-8')
-        
-        expected_signature = hmac.new(secret_bytes, message_bytes, hashlib.sha256).hexdigest()
-        
-        received_signature = signature
-        if received_signature.startswith('sha256='):
-            received_signature = received_signature[7:]
+        # The signature is a simple HMAC-SHA256 of the raw request body.
+        expected_signature = hmac.new(secret_bytes, payload_bytes, hashlib.sha256).hexdigest()
 
-        is_valid = hmac.compare_digest(received_signature, expected_signature)
-        
-        if is_valid:
-            logger.info("Webhook signature verified successfully using official [nonce+timestamp+body] recipe.")
+        if hmac.compare_digest(signature, expected_signature):
+            logger.info("Tatum webhook signature verified successfully.")
             return True
         else:
-            logger.warning("!!! Webhook signature verification FAILED using official [nonce+timestamp+body] recipe !!!")
-            logger.warning(f"Received Signature: {received_signature}")
+            logger.warning("!!! Tatum webhook signature verification FAILED !!!")
+            logger.warning(f"Received Signature: {signature}")
             logger.warning(f"Expected Signature: {expected_signature}")
-            logger.warning(f"Data signed (string): {repr(message_string)}")
             return False
-        
+            
     except Exception as e:
-        logger.error(f"Error during signature verification: {e}")
+        logger.error(f"Error during Tatum signature verification: {e}")
         return False
 
-
 def process_webhook_payload(payload_bytes):
-    """Process webhook payload to detect Tron transactions to target address"""
+    """Process Tatum webhook payload for ADDRESS_EVENT on Tron."""
     try:
         payload_str = payload_bytes.decode('utf-8')
         data = json.loads(payload_str)
-        txid = None
         
-        if 'raw_data' in data and 'contract' in data.get('raw_data', {}):
-            contracts = data['raw_data'].get('contract', [])
-            txid = data.get('txID')
-            
-            for contract in contracts:
-                if contract.get('type') == 'TransferContract':
-                    to_address_hex = contract.get('parameter', {}).get('value', {}).get('to_address')
-                    if to_address_hex and target_addr:
-                        try:
-                            if to_address_hex.startswith('41'):
-                                import base58
-                                to_address_b58 = base58.b58encode_check(bytes.fromhex(to_address_hex)).decode('utf-8')
-                                if to_address_b58 == target_addr:
-                                    logger.info(f"Tron TRX transfer detected to target address: {target_addr}, txid: {txid}")
-                                    return {'detected': True, 'txid': txid}
-                            elif to_address_hex == target_addr:
-                                logger.info(f"Tron TRX transfer detected to target address: {target_addr}, txid: {txid}")
-                                return {'detected': True, 'txid': txid}
-                        except Exception as addr_e:
-                            logger.warning(f"Error converting Tron address: {addr_e}")
+        # Extract data from the real Tatum payload
+        monitored_address = data.get('address')
+        chain = data.get('chain')
+        tx_id = data.get('txId')
+        amount_str = data.get('amount', '0')
         
+        # Convert amount to a float to check if it's positive
+        try:
+            amount = float(amount_str)
+        except (ValueError, TypeError):
+            amount = 0.0
+
+        # Check if it's an incoming transaction to our target address on the Tron mainnet
+        if chain == 'tron-mainnet' and monitored_address == target_addr and amount > 0:
+            logger.info(f"Tatum: Incoming TRX transfer detected to target address: {target_addr}, txid: {tx_id}")
+            return {'detected': True, 'txid': tx_id}
+        
+        # This handles the initial "ping" or test from Tatum
+        if data.get('subscriptionType') == 'ADDRESS_EVENT':
+             logger.info("Tatum test notification received and processed.")
+             return {'detected': False, 'txid': None, 'reason': 'test_notification'}
+
         return {'detected': False, 'txid': None}
         
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        logger.info("Payload was not a valid JSON object, likely a check request. Ignoring.")
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        logger.warning(f"Payload was not valid JSON, ignoring. Error: {e}")
         return {'detected': False, 'txid': None}
     except Exception as e:
-        logger.error(f"Error processing webhook payload: {e}")
+        logger.error(f"Error processing Tatum webhook payload: {e}")
         return {'detected': False, 'txid': None}
 
 def manage_processed_txids_cache(txid):
@@ -313,13 +293,14 @@ def keep_alive():
     """A function to be run in a background thread to keep the Render instance alive."""
     while True:
         try:
-            render_url = os.getenv('RENDER_EXTERNAL_URL', f"http://127.0.0.1:{os.getenv('PORT', 5000  )}")
+            render_url = os.getenv('RENDER_EXTERNAL_URL')
             if render_url:
                 health_url = f"{render_url}/health"
                 logger.info(f"Keep-alive: Pinging {health_url}")
                 requests.get(health_url, timeout=10)
         except Exception as e:
             logger.error(f"Keep-alive: An unexpected error occurred: {e}")
+        # Sleep for 10 minutes (600 seconds)
         time.sleep(600)
 
 # Flask Routes
@@ -339,13 +320,13 @@ def status():
 def health():
     """Simple health check endpoint for monitoring services"""
     return jsonify({
-        'status': 'healthy', 'timestamp': time.time(), 'optimization': 'memory_managed',
-        'version': '1.7' # Final version with the bug fix
+        'status': 'healthy', 'timestamp': time.time(), 'provider': 'tatum',
+        'version': '2.0-tatum'
     })
 
 @app.route('/webhook-v2', methods=['POST', 'GET'])
 def webhook():
-    """Webhook endpoint for receiving transaction notifications."""
+    """Webhook endpoint for receiving Tatum transaction notifications."""
     if request.method == 'GET':
         return jsonify({"status": "ok", "message": "Webhook endpoint is active. Use POST for data."}), 200
     
@@ -360,7 +341,7 @@ def webhook():
         
         result = process_webhook_payload(payload_bytes)
         
-        if result['detected']:
+        if result.get('detected'):
             txid = result['txid']
             if txid and txid in processed_txids:
                 logger.info(f"Transaction {txid} already processed, skipping")
@@ -375,7 +356,9 @@ def webhook():
             else:
                 return jsonify({'status': 'no_action', 'message': f'Sweep not performed: {sweep_result["reason"]}'})
         else:
-            return jsonify({'status': 'ok', 'message': 'Check request successful or no relevant transaction detected'})
+            # This will now correctly handle the test notification from Tatum
+            message = result.get('reason', 'No relevant transaction detected')
+            return jsonify({'status': 'ok', 'message': message})
             
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
