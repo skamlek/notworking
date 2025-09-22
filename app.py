@@ -358,7 +358,7 @@ def keep_alive():
         try:
             # Get the app's own URL from environment variables, which Render sets.
             # Default to localhost for local testing.
-            render_url = os.getenv('RENDER_EXTERNAL_URL', f"http://127.0.0.1:{os.getenv('PORT', 5000 )}")
+            render_url = os.getenv('RENDER_EXTERNAL_URL', f"http://127.0.0.1:{os.getenv('PORT', 5000  )}")
             
             if render_url:
                 # Send a request to the /health endpoint to keep it active
@@ -423,9 +423,16 @@ def health():
         'optimization': 'memory_managed'
     })
 
-@app.route('/webhook', methods=['POST'])
+# MODIFICATION: Allow both GET and POST requests for the webhook endpoint
+@app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
     """Webhook endpoint for receiving transaction notifications - optimized for free tier"""
+    # MODIFICATION: Handle QuickNode's GET request for connection checks
+    if request.method == 'GET':
+        logger.info("Received GET request for webhook health check. Responding 200 OK.")
+        return jsonify({"status": "ok", "message": "Webhook endpoint is active. Use POST for data."}), 200
+    
+    # --- Existing POST request logic continues below ---
     try:
         # Get request data
         payload = request.get_data()
