@@ -3,7 +3,7 @@
 TRX Sweep Bot Flask Application - Optimized for Render Free Tier
 Webhook-based TRX sweeping bot that responds to Tatum webhook notifications.
 Uses a reliable RPC to prevent rate-limiting and is optimized for performance.
-Version: 2.3
+Version: 2.3 (Modified for Chainstack)
 """
 
 import os
@@ -23,7 +23,7 @@ from logging import getLogger
 # Configure simple logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format=\'%(asctime)s - %(levelname)s - %(message)s\'
 )
 logger = getLogger(__name__)
 
@@ -43,7 +43,7 @@ def log_request_info():
         data = request.get_data()
         if data:
             try:
-                app.logger.info(f"Body (decoded): {data.decode('utf-8')}")
+                app.logger.info(f"Body (decoded): {data.decode(\'utf-8\')}")
             except UnicodeDecodeError:
                 app.logger.info(f"Body (binary/non-UTF-8): {data}")
         else:
@@ -61,6 +61,9 @@ safe_wallet = None
 webhook_security_token = None
 min_trx_left = None
 permission_id = None
+chainstack_api_url = None
+chainstack_username = None
+chainstack_password = None
 
 # In-memory cache for processed transaction IDs
 MAX_PROCESSED_TXIDS = 1000
@@ -68,29 +71,29 @@ processed_txids = set()
 
 def validate_env_vars():
     """Validate required environment variables"""
-    required_vars = ['TARGET_ADDR', 'SAFE_WALLET', 'PRIVATE_KEY', 'WEBHOOK_SECURITY_TOKEN']
+    required_vars = [\'TARGET_ADDR\', \'SAFE_WALLET\', \'PRIVATE_KEY\', \'WEBHOOK_SECURITY_TOKEN\', \'CHAINSTACK_API_URL\', \'CHAINSTACK_USERNAME\', \'CHAINSTACK_PASSWORD\']
     missing_vars = [var for var in required_vars if not os.getenv(var)]
     
     if missing_vars:
-        logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+        logger.error(f"Missing required environment variables: {\', \'.join(missing_vars)}")
         exit(1)
     
     try:
-        target_addr_val = os.getenv('TARGET_ADDR', '').strip()
-        if not (target_addr_val.startswith('T') and len(target_addr_val) == 34):
+        target_addr_val = os.getenv(\'TARGET_ADDR\', \'\').strip()
+        if not (target_addr_val.startswith(\'T\') and len(target_addr_val) == 34):
             raise ValueError(f"Invalid TARGET_ADDR format: {target_addr_val}")
 
-        safe_wallet_val = os.getenv('SAFE_WALLET', '').strip()
-        if not (safe_wallet_val.startswith('T') and len(safe_wallet_val) == 34):
+        safe_wallet_val = os.getenv(\'SAFE_WALLET\', \'\').strip()
+        if not (safe_wallet_val.startswith(\'T\') and len(safe_wallet_val) == 34):
             raise ValueError(f"Invalid SAFE_WALLET format: {safe_wallet_val}")
 
-        private_key_val = os.getenv('PRIVATE_KEY', '').strip().lstrip('0x')
+        private_key_val = os.getenv(\'PRIVATE_KEY\', \'\').strip().lstrip(\'0x\')
         if len(private_key_val) != 64:
             raise ValueError("Invalid PRIVATE_KEY format: must be 64 hex characters")
         PrivateKey(bytes.fromhex(private_key_val))
 
-        float(os.getenv('MIN_TRX_LEFT', '0.3'))
-        int(os.getenv('PERMISSION_ID', '4'))
+        float(os.getenv(\'MIN_TRX_LEFT\', \'0.3\'))
+        int(os.getenv(\'PERMISSION_ID\', \'4\'))
         
         logger.info("Environment variables validated successfully")
     except Exception as e:
@@ -101,7 +104,7 @@ def get_balance(client_instance, address):
     """Get TRX balance for address in TRX units"""
     try:
         account_info = client_instance.get_account(address)
-        balance_sun = account_info.get('balance', 0)
+        balance_sun = account_info.get(\'balance\', 0)
         return balance_sun / 1_000_000
     except Exception as e:
         logger.error(f"Error getting balance for {address}: {e}")
@@ -109,16 +112,17 @@ def get_balance(client_instance, address):
 
 def sweep_trx_async(client_instance, p_key, t_addr, s_wallet, m_trx_left, p_id):
     """Optimized sweep function that broadcasts transaction without waiting for confirmation"""
+    global chainstack_api_url, chainstack_username, chainstack_password
     try:
         balance_sun = int(get_balance(client_instance, t_addr) * 1_000_000)
         fee_reserve_sun = int(m_trx_left * 1_000_000)
         
         if balance_sun <= (1_000_000 + fee_reserve_sun):
-            return {'success': False, 'reason': 'insufficient_balance'}
+            return {\'success\': False, \'reason\': \'insufficient_balance\'}
         
         send_amount_sun = balance_sun - fee_reserve_sun
         if send_amount_sun <= 0:
-            return {'success': False, 'reason': 'insufficient_after_fees'}
+            return {\'success\': False, \'reason\': \'insufficient_after_fees\'}
         
         logger.info(f"Sweeping {send_amount_sun / 1_000_000:.6f} TRX from {t_addr} to {s_wallet}")
         
@@ -128,50 +132,76 @@ def sweep_trx_async(client_instance, p_key, t_addr, s_wallet, m_trx_left, p_id):
         else:
             txn = client_instance.trx.transfer(t_addr, s_wallet, send_amount_sun).permission_id(p_id).build().sign(p_key)
         
-        result = txn.broadcast()
+        # --- Chainstack Broadcast --- 
+        signed_transaction_json = txn.to_json()
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        auth = (chainstack_username, chainstack_password)
+        payload = {"transaction": signed_transaction_json}
+
+        response = requests.post(chainstack_api_url + "/broadcasttransaction", json=payload, headers=headers, auth=auth)
+        response.raise_for_status() # Raise an exception for HTTP errors
+
+        broadcast_result = response.json()
         
-        if hasattr(result, 'txid'):
-            logger.info(f"Transaction broadcasted successfully! TXID: {result.txid}")
-            return {'success': True, 'txid': result.txid}
+        if broadcast_result.get("result", False) or broadcast_result.get("code") == "SUCCESS":
+            txid = broadcast_result.get(\'txid\')
+            logger.info(f"Transaction broadcasted successfully via Chainstack! TXID: {txid}")
+            return {\'success\': True, \'txid\': txid}
         else:
-            logger.error(f"Broadcast failed: {result}")
-            return {'success': False, 'reason': 'broadcast_failed'}
+            logger.error(f"Chainstack broadcast failed: {broadcast_result}")
+            return {\'success\': False, \'reason\': \'chainstack_broadcast_failed\', \'details\': broadcast_result}
             
+    except requests.exceptions.RequestException as e:
+        logger.error(f"HTTP Request to Chainstack failed: {e}")
+        if e.response:
+            logger.error(f"Chainstack Response status: {e.response.status_code}")
+            logger.error(f"Chainstack Response body: {e.response.text}")
+        return {\'success\': False, \'reason\': \'chainstack_http_error\', \'details\': str(e)}
     except Exception as e:
         logger.error(f"Error during sweep: {e}")
-        return {'success': False, 'reason': str(e)}
+        return {\'success\': False, \'reason\': str(e)}
 
 def initialize_bot():
     """Initialize bot configuration and Tron client"""
-    global client, private_key, target_addr, safe_wallet, webhook_security_token, min_trx_left, permission_id
-    logger.info("Initializing TRX Sweep Bot for Tatum...")
+    global client, private_key, target_addr, safe_wallet, webhook_security_token, min_trx_left, permission_id, chainstack_api_url, chainstack_username, chainstack_password
+    logger.info("Initializing TRX Sweep Bot for Chainstack...")
     validate_env_vars()
     
-    target_addr = os.getenv('TARGET_ADDR').strip()
-    safe_wallet = os.getenv('SAFE_WALLET').strip()
-    private_key_hex = os.getenv('PRIVATE_KEY').strip().lstrip('0x')
-    webhook_security_token = os.getenv('WEBHOOK_SECURITY_TOKEN').strip()
-    min_trx_left = float(os.getenv('MIN_TRX_LEFT', '0.3'))
-    permission_id = int(os.getenv('PERMISSION_ID', '4'))
+    target_addr = os.getenv(\'TARGET_ADDR\').strip()
+    safe_wallet = os.getenv(\'SAFE_WALLET\').strip()
+    private_key_hex = os.getenv(\'PRIVATE_KEY\').strip().lstrip(\'0x\')
+    webhook_security_token = os.getenv(\'WEBHOOK_SECURITY_TOKEN\').strip()
+    min_trx_left = float(os.getenv(\'MIN_TRX_LEFT\', \'0.3\'))
+    permission_id = int(os.getenv(\'PERMISSION_ID\', \'4\'))
     
-    tatum_api_key = webhook_security_token
-    tron_rpc_url = f"https://api.tatum.io/v3/blockchain/node/tron/{tatum_api_key}"
-    provider = HTTPProvider(endpoint_uri=tron_rpc_url )
+    # Chainstack Configuration
+    chainstack_api_url = os.getenv(\'CHAINSTACK_API_URL\').strip()
+    chainstack_username = os.getenv(\'CHAINSTACK_USERNAME\').strip()
+    chainstack_password = os.getenv(\'CHAINSTACK_PASSWORD\').strip()
+
+    # Use Chainstack RPC for Tron connections
+    # Note: Tronpy's HTTPProvider does not directly support basic auth in the URL.
+    # We will use requests library for broadcasting with auth.
+    # For fetching account info, we can still use Tronpy with the base URL.
+    provider = HTTPProvider(endpoint_uri=chainstack_api_url)
     client = Tron(provider=provider)
     
     private_key = PrivateKey(bytes.fromhex(private_key_hex))
-    logger.info(f"Bot initialized successfully. Using Tatum RPC for Tron connections.")
+    logger.info(f"Bot initialized successfully. Using Chainstack RPC for Tron connections.")
     logger.info(f"Target address: {target_addr}")
 
 def verify_webhook_signature(headers, payload_bytes, secret):
     """Verify Tatum webhook signature."""
-    signature = headers.get('x-payload-signature')
+    signature = headers.get(\'x-payload-signature\')
     if not signature:
-        logger.warning("Webhook verification failed: 'x-payload-signature' header missing.")
+        logger.warning("Webhook verification failed: \'x-payload-signature\' header missing.")
         return False
 
     try:
-        secret_bytes = secret.encode('utf-8')
+        secret_bytes = secret.encode(\'utf-8\')
         expected_signature = hmac.new(secret_bytes, payload_bytes, hashlib.sha256).hexdigest()
 
         if hmac.compare_digest(signature, expected_signature):
@@ -187,24 +217,24 @@ def verify_webhook_signature(headers, payload_bytes, secret):
 def process_webhook_payload(payload_bytes):
     """Process Tatum webhook payload for ADDRESS_EVENT on Tron."""
     try:
-        data = json.loads(payload_bytes.decode('utf-8'))
+        data = json.loads(payload_bytes.decode(\'utf-8\'))
         
-        is_tron_mainnet = data.get('chain') == 'tron-mainnet'
-        is_target_address = data.get('address') == target_addr
-        is_incoming = float(data.get('amount', '0')) > 0
+        is_tron_mainnet = data.get(\'chain\') == \'tron-mainnet\'
+        is_target_address = data.get(\'address\') == target_addr
+        is_incoming = float(data.get(\'amount\', \'0\')) > 0
         
         if is_tron_mainnet and is_target_address and is_incoming:
-            tx_id = data.get('txId')
+            tx_id = data.get(\'txId\')
             logger.info(f"Tatum: Incoming TRX transfer detected to target address, txid: {tx_id}")
-            return {'detected': True, 'txid': tx_id}
+            return {\'detected\': True, \'txid\': tx_id}
         
-        if data.get('subscriptionType') == 'ADDRESS_EVENT':
-             return {'detected': False, 'reason': 'test_notification'}
+        if data.get(\'subscriptionType\') == \'ADDRESS_EVENT\':
+             return {\'detected\': False, \'reason\': \'test_notification\'}
 
-        return {'detected': False, 'reason': 'not_relevant'}
+        return {\'detected\': False, \'reason\': \'not_relevant\'}
     except Exception as e:
         logger.error(f"Error processing Tatum webhook payload: {e}")
-        return {'detected': False, 'reason': 'payload_error'}
+        return {\'detected\': False, \'reason\': \'payload_error\'}
 
 def manage_processed_txids_cache(txid):
     """Manage the processed transaction IDs cache"""
@@ -217,11 +247,11 @@ def manage_processed_txids_cache(txid):
             logger.info(f"Processed TXIDs cache trimmed.")
 
 def keep_alive():
-    """Pings the app's health endpoint to keep the Render instance alive."""
+    """Pings the app\'s health endpoint to keep the Render instance alive."""
     while True:
         time.sleep(600)
         try:
-            render_url = os.getenv('RENDER_EXTERNAL_URL')
+            render_url = os.getenv(\'RENDER_EXTERNAL_URL\')
             if render_url:
                 health_url = f"{render_url}/health"
                 logger.info(f"Keep-alive: Pinging {health_url}")
@@ -230,51 +260,53 @@ def keep_alive():
             logger.error(f"Keep-alive: An unexpected error occurred: {e}")
 
 # --- Flask Routes ---
-@app.route('/', methods=['GET'])
+@app.route(\'/\', methods=[\'GET\'])
 def status():
     if not client:
-        return jsonify({'status': 'error', 'message': 'Bot not initialized'}), 500
+        return jsonify({\'status\': \'error\', \'message\': \'Bot not initialized\'}), 500
     return jsonify({
-        'status': 'active', 'message': 'TRX Sweep Bot is running (Tatum Mode)',
-        'target_address': target_addr, 'current_balance_trx': get_balance(client, target_addr)
+        \'status\': \'active\', \'message\': \'TRX Sweep Bot is running (Chainstack Mode)\',
+        \'target_address\': target_addr, \'current_balance_trx\': get_balance(client, target_addr)
     })
 
-@app.route('/health', methods=['GET'])
+@app.route(\'/health\', methods=[\'GET\'])
 def health():
-    return jsonify({'status': 'healthy', 'timestamp': time.time()})
+    return jsonify({\'status\': \'healthy\', \'timestamp\': time.time()})
 
-@app.route('/webhook-v2', methods=['POST', 'GET'])
+@app.route(\'/webhook-v2\', methods=[\'POST\', \'GET\'])
 def webhook():
-    if request.method == 'GET':
+    if request.method == \'GET\':
         return jsonify({"status": "ok", "message": "Webhook endpoint is active. Use POST for data."})
     
     payload_bytes = request.get_data()
     if not webhook_security_token or not verify_webhook_signature(request.headers, payload_bytes, webhook_security_token):
-        return jsonify({'error': 'Invalid signature'}), 401
+        return jsonify({\'error\': \'Invalid signature\'}), 401
     
     result = process_webhook_payload(payload_bytes)
-    if result.get('detected'):
-        txid = result['txid']
+    if result.get(\'detected\'):
+        txid = result[\'txid\']
         if txid in processed_txids:
-            return jsonify({'status': 'skipped', 'message': 'Transaction already processed'})
+            return jsonify({\'status\': \'skipped\', \'message\': \'Transaction already processed\'})
         
         sweep_result = sweep_trx_async(client, private_key, target_addr, safe_wallet, min_trx_left, permission_id)
-        if sweep_result['success']:
+        if sweep_result[\'success\']:
             manage_processed_txids_cache(txid)
-            return jsonify({'status': 'success', 'message': 'Sweep transaction broadcasted', 'txid': sweep_result['txid']})
+            return jsonify({\'status\': \'success\', \'message\': \'Sweep transaction broadcasted\', \'txid\': sweep_result[\'txid\']})
         else:
-            return jsonify({'status': 'no_action', 'message': f'Sweep not performed: {sweep_result["reason"]}'})
+            return jsonify({\'status\': \'no_action\', \'message\': f\'Sweep not performed: {sweep_result["reason"]}\'})
     else:
-        return jsonify({'status': 'ok', 'message': result.get('reason', 'No action taken')})
+        return jsonify({\'status\': \'ok\', \'message\': result.get(\'reason\', \'No action taken\')})
 
 # --- App Initialization ---
 try:
     initialize_bot()
-    keep_alive_thread = threading.Thread(name='keep-alive', target=keep_alive, daemon=True)
+    keep_alive_thread = threading.Thread(name=\'keep-alive\', target=keep_alive, daemon=True)
     keep_alive_thread.start()
 except Exception as e:
     logger.critical(f"FATAL: Failed to initialize bot. Error: {e}")
 
 if __name__ == "__main__":
-    port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    port = int(os.getenv(\'PORT\', 5000))
+    app.run(host=\'0.0.0.0\', port=port, debug=False)
+
+
